@@ -1,0 +1,21 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.4",
+	"Category": "",
+	"Description": "Apex Protocol",
+	"Modules": [
+		{
+			"Name": "ApexProtocol",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"AdditionalDependencies": ["Engine","UMG"]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "ModelingToolsEditorMode",
+			"Enabled": true,
+			"TargetAllowList": ["Editor"]
+		}
+	]
+}
