@@ -17,6 +17,8 @@ public class ApexProtocol : ModuleRules
 				"InputCore",
 				"EnhancedInput",
 				"NavigationSystem",
+				"Json",
+				"JsonUtilities",
 				"WebSockets",
 				"UMG"
 			});

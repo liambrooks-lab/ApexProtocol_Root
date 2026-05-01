@@ -1,6 +1,8 @@
 #include "ApexEndgameDirector.h"
 #include "ApexGameMode.h"
 #include "OmniKernel_OS.h"
+#include "../Entities/Characters/A_BioAsset.h"
+#include "../Systems/AudioDirector.h"
 #include "Kismet/GameplayStatics.h"
 
 AApexEndgameDirector::AApexEndgameDirector()
@@ -42,7 +44,19 @@ void AApexEndgameDirector::HandleEscapeVectorActivated()
 
 void AApexEndgameDirector::HandleApexProtocolCompleted()
 {
+	// === ENDGAME SEQUENCE ===
+	// 1. Shut down OmniKernel (ceases all facility hostility)
+	if (CachedOmniKernel != nullptr && !CachedOmniKernel->IsOmniKernelShutdown())
+	{
+		CachedOmniKernel->ShutdownOmniKernel();
+	}
+
+	// 2. Deactivate all BioAssets (stop all AI movement and sensing)
+	DeactivateAllBioAssets();
+
+	// 3. Fire Blueprint cinematic event
 	OnApexProtocolCompleted_BP();
+	OnEndgameCinematicTriggered();
 }
 
 void AApexEndgameDirector::HandleFinalPurgeChanged(bool bPurgeActive)
@@ -58,4 +72,23 @@ void AApexEndgameDirector::HandleCoreBreachPathUnlocked()
 void AApexEndgameDirector::HandleOmniKernelShutdownChanged(bool bIsShutdown)
 {
 	OnOmniKernelShutdown_BP(bIsShutdown);
+}
+
+// ─────────────────────────────────────────────────────────────
+// DeactivateAllBioAssets — Master kill switch for all facility hostiles
+// ─────────────────────────────────────────────────────────────
+void AApexEndgameDirector::DeactivateAllBioAssets()
+{
+	TArray<AActor*> BioAssetActors;
+	UGameplayStatics::GetAllActorsOfClass(this, AA_BioAsset::StaticClass(), BioAssetActors);
+
+	for (AActor* Actor : BioAssetActors)
+	{
+		if (AA_BioAsset* BioAsset = Cast<AA_BioAsset>(Actor))
+		{
+			BioAsset->Deactivate();
+		}
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("AApexEndgameDirector: Deactivated %d BioAssets."), BioAssetActors.Num());
 }

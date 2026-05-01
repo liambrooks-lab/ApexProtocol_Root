@@ -15,6 +15,9 @@
 #include "Kismet/GameplayStatics.h"
 #include "Math/RotationMatrix.h"
 
+// ============================================================
+// Constructor
+// ============================================================
 AA_PlayerCharacter::AA_PlayerCharacter()
 {
 	BiologicalSystems = CreateDefaultSubobject<UToxicityManager>(TEXT("BiologicalSystems"));
@@ -43,16 +46,42 @@ AA_PlayerCharacter::AA_PlayerCharacter()
 	LastCheckpointSectorID = NAME_None;
 	bBiologicalCollapseTriggered = false;
 
+	// Movement modifiers
+	bIsCrouching = false;
+	bIsSprinting = false;
+	CrouchAcousticMultiplier = 0.25f;
+	SprintAcousticMultiplier = 2.0f;
+	CrouchWalkSpeed = 130.0f;
+	SprintSpeed = 475.0f;
+	NormalWalkSpeed = 275.0f;
+
+	// Input latency
+	MaxInputLatencySeconds = 0.35f;
+	RawForwardInput = 0.0f;
+	RawRightInput = 0.0f;
+
 	GetCharacterMovement()->bOrientRotationToMovement = false;
-	GetCharacterMovement()->MaxWalkSpeed = 275.0f;
+	GetCharacterMovement()->MaxWalkSpeed = NormalWalkSpeed;
 }
 
+// ============================================================
+// BeginPlay — Cache references, bind ToxicityManager delegates
+// ============================================================
 void AA_PlayerCharacter::BeginPlay()
 {
 	Super::BeginPlay();
 
 	CachedOmniKernel = Cast<AOmniKernel_OS>(UGameplayStatics::GetActorOfClass(this, AOmniKernel_OS::StaticClass()));
 	CachedAudioDirector = Cast<AAudioDirector>(UGameplayStatics::GetActorOfClass(this, AAudioDirector::StaticClass()));
+
+	// Bind ToxicityManager threshold delegates
+	if (BiologicalSystems != nullptr)
+	{
+		BiologicalSystems->OnHallucinationThresholdReached.AddDynamic(this, &AA_PlayerCharacter::HandleHallucinationThreshold);
+		BiologicalSystems->OnHallucinationRecovered.AddDynamic(this, &AA_PlayerCharacter::HandleHallucinationRecovered);
+		BiologicalSystems->OnCriticalToxicityReached.AddDynamic(this, &AA_PlayerCharacter::HandleCriticalToxicity);
+		BiologicalSystems->OnBiologicalCollapseEvent.AddDynamic(this, &AA_PlayerCharacter::HandleBiologicalCollapseDelegate);
+	}
 
 	if (AApexGameMode* ApexGameMode = GetWorld() != nullptr ? Cast<AApexGameMode>(GetWorld()->GetAuthGameMode()) : nullptr)
 	{
@@ -63,6 +92,9 @@ void AA_PlayerCharacter::BeginPlay()
 	}
 }
 
+// ============================================================
+// Tick
+// ============================================================
 void AA_PlayerCharacter::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
@@ -70,6 +102,7 @@ void AA_PlayerCharacter::Tick(float DeltaTime)
 	AcousticOutputLevel = FMath::Max(0.0f, AcousticOutputLevel - (25.0f * DeltaTime));
 	UpdateSectorState(DeltaTime);
 	RefreshAudioState();
+	TickInputLatencyBuffer(DeltaTime);
 
 	if (BiologicalSystems != nullptr && BiologicalSystems->GetCurrentToxicity() >= 100.0f && !bBiologicalCollapseTriggered)
 	{
@@ -77,10 +110,12 @@ void AA_PlayerCharacter::Tick(float DeltaTime)
 	}
 }
 
+// ============================================================
+// Input Binding
+// ============================================================
 void AA_PlayerCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 {
 	Super::SetupPlayerInputComponent(PlayerInputComponent);
-
 	check(PlayerInputComponent);
 
 	PlayerInputComponent->BindAxis(TEXT("MoveForward"), this, &AA_PlayerCharacter::MoveForward);
@@ -90,8 +125,193 @@ void AA_PlayerCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputC
 	PlayerInputComponent->BindAction(TEXT("Interact"), IE_Pressed, this, &AA_PlayerCharacter::Interact);
 	PlayerInputComponent->BindAction(TEXT("HoloTerminal"), IE_Pressed, this, &AA_PlayerCharacter::ToggleTerminal);
 	PlayerInputComponent->BindAction(TEXT("VoiceCommand_Override"), IE_Pressed, this, &AA_PlayerCharacter::VoiceOverride);
+	PlayerInputComponent->BindAction(TEXT("Crouch"), IE_Pressed, this, &AA_PlayerCharacter::ToggleCrouch);
+	PlayerInputComponent->BindAction(TEXT("Sprint"), IE_Pressed, this, &AA_PlayerCharacter::StartSprint);
+	PlayerInputComponent->BindAction(TEXT("Sprint"), IE_Released, this, &AA_PlayerCharacter::StopSprint);
 }
 
+// ============================================================
+// Input Latency Ring Buffer
+// At high toxicity, inputs are deferred by a scaled delay.
+// This simulates neurological impairment without time dilation.
+// ============================================================
+void AA_PlayerCharacter::TickInputLatencyBuffer(float DeltaTime)
+{
+	// Process any mature samples in the buffer
+	for (int32 i = InputLatencyBuffer.Num() - 1; i >= 0; --i)
+	{
+		InputLatencyBuffer[i].DelayRemaining -= DeltaTime;
+
+		if (InputLatencyBuffer[i].DelayRemaining <= 0.0f)
+		{
+			ApplyDeferredMovement(InputLatencyBuffer[i].ForwardValue, InputLatencyBuffer[i].RightValue);
+			InputLatencyBuffer.RemoveAt(i);
+		}
+	}
+}
+
+void AA_PlayerCharacter::ApplyDeferredMovement(float ForwardValue, float RightValue)
+{
+	if (Controller == nullptr)
+	{
+		return;
+	}
+
+	const FRotator ControlRotation = Controller->GetControlRotation();
+	const FRotator YawRotation(0.0f, ControlRotation.Yaw, 0.0f);
+
+	if (!FMath::IsNearlyZero(ForwardValue))
+	{
+		const FVector ForwardDirection = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::X);
+		AddMovementInput(ForwardDirection, ForwardValue);
+	}
+
+	if (!FMath::IsNearlyZero(RightValue))
+	{
+		const FVector RightDirection = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::Y);
+		AddMovementInput(RightDirection, RightValue);
+	}
+}
+
+// ============================================================
+// Movement — With Latency Injection & Acoustic Modulation
+// ============================================================
+void AA_PlayerCharacter::MoveForward(float Value)
+{
+	if (Controller == nullptr || FMath::IsNearlyZero(Value))
+	{
+		return;
+	}
+
+	// Determine acoustic modifier
+	float AcousticMod = 1.0f;
+	if (bIsCrouching) AcousticMod = CrouchAcousticMultiplier;
+	else if (bIsSprinting) AcousticMod = SprintAcousticMultiplier;
+
+	ReportAcousticEvent(40.0f * AcousticMod);
+
+	// If toxicity is above hallucination threshold, defer input
+	const float LatencyScalar = BiologicalSystems != nullptr ? BiologicalSystems->GetInputLatencyScalar() : 0.0f;
+
+	if (LatencyScalar > 0.01f)
+	{
+		const float Delay = LatencyScalar * MaxInputLatencySeconds;
+		InputLatencyBuffer.Add(FDeferredInputSample(Value, 0.0f, Delay));
+	}
+	else
+	{
+		const FRotator ControlRotation = Controller->GetControlRotation();
+		const FRotator YawRotation(0.0f, ControlRotation.Yaw, 0.0f);
+		const FVector ForwardDirection = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::X);
+		AddMovementInput(ForwardDirection, Value);
+	}
+}
+
+void AA_PlayerCharacter::MoveRight(float Value)
+{
+	if (Controller == nullptr || FMath::IsNearlyZero(Value))
+	{
+		return;
+	}
+
+	float AcousticMod = 1.0f;
+	if (bIsCrouching) AcousticMod = CrouchAcousticMultiplier;
+	else if (bIsSprinting) AcousticMod = SprintAcousticMultiplier;
+
+	ReportAcousticEvent(35.0f * AcousticMod);
+
+	const float LatencyScalar = BiologicalSystems != nullptr ? BiologicalSystems->GetInputLatencyScalar() : 0.0f;
+
+	if (LatencyScalar > 0.01f)
+	{
+		const float Delay = LatencyScalar * MaxInputLatencySeconds;
+		InputLatencyBuffer.Add(FDeferredInputSample(0.0f, Value, Delay));
+	}
+	else
+	{
+		const FRotator ControlRotation = Controller->GetControlRotation();
+		const FRotator YawRotation(0.0f, ControlRotation.Yaw, 0.0f);
+		const FVector RightDirection = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::Y);
+		AddMovementInput(RightDirection, Value);
+	}
+}
+
+void AA_PlayerCharacter::TurnAtRate(float Value)
+{
+	AddControllerYawInput(Value);
+}
+
+void AA_PlayerCharacter::LookUpAtRate(float Value)
+{
+	AddControllerPitchInput(Value);
+}
+
+// ============================================================
+// Crouch / Sprint — Movement Modes with Acoustic Coupling
+// ============================================================
+void AA_PlayerCharacter::ToggleCrouch()
+{
+	bIsCrouching = !bIsCrouching;
+	bIsSprinting = false; // Mutually exclusive
+
+	GetCharacterMovement()->MaxWalkSpeed = bIsCrouching ? CrouchWalkSpeed : NormalWalkSpeed;
+}
+
+void AA_PlayerCharacter::StartSprint()
+{
+	bIsSprinting = true;
+	bIsCrouching = false;
+	GetCharacterMovement()->MaxWalkSpeed = SprintSpeed;
+}
+
+void AA_PlayerCharacter::StopSprint()
+{
+	bIsSprinting = false;
+	GetCharacterMovement()->MaxWalkSpeed = NormalWalkSpeed;
+}
+
+// ============================================================
+// ToxicityManager Delegate Handlers
+// ============================================================
+void AA_PlayerCharacter::HandleHallucinationThreshold(float ToxicityLevel)
+{
+	if (CachedAudioDirector != nullptr)
+	{
+		const float Normalized = BiologicalSystems != nullptr ? BiologicalSystems->GetInputLatencyScalar() : 0.0f;
+		CachedAudioDirector->SetHallucinationIntensity(Normalized);
+	}
+
+	OnHallucinationOnset(ToxicityLevel);
+}
+
+void AA_PlayerCharacter::HandleHallucinationRecovered(float ToxicityLevel)
+{
+	if (CachedAudioDirector != nullptr)
+	{
+		CachedAudioDirector->SetHallucinationIntensity(0.0f);
+	}
+
+	OnHallucinationCleared();
+}
+
+void AA_PlayerCharacter::HandleCriticalToxicity(float ToxicityLevel)
+{
+	// Involuntary gasp — loud acoustic emission at critical toxicity
+	ReportAcousticEvent(70.0f);
+	OnCriticalToxicityOnset(ToxicityLevel);
+}
+
+void AA_PlayerCharacter::HandleBiologicalCollapseDelegate(float ToxicityLevel)
+{
+	if (!bBiologicalCollapseTriggered)
+	{
+		HandleBiologicalCollapse();
+	}
+}
+
+// ============================================================
+// Terminal Toggle — Diegetic HoloTerminal (no pause)
+// ============================================================
 void AA_PlayerCharacter::ToggleTerminal()
 {
 	bTerminalVisible = !bTerminalVisible;
@@ -99,7 +319,6 @@ void AA_PlayerCharacter::ToggleTerminal()
 	if (bTerminalVisible && TerminalWidgetClass != nullptr && ActiveTerminalWidget == nullptr)
 	{
 		ActiveTerminalWidget = CreateWidget<UTerminalWidget_Native>(GetWorld(), TerminalWidgetClass);
-
 		if (ActiveTerminalWidget != nullptr)
 		{
 			ActiveTerminalWidget->AddToViewport();
@@ -124,7 +343,6 @@ void AA_PlayerCharacter::ToggleTerminal()
 	if (APlayerController* PlayerController = Cast<APlayerController>(GetController()))
 	{
 		PlayerController->bShowMouseCursor = bTerminalVisible;
-
 		if (bTerminalVisible)
 		{
 			FInputModeGameAndUI InputMode;
@@ -137,10 +355,11 @@ void AA_PlayerCharacter::ToggleTerminal()
 			PlayerController->SetInputMode(InputMode);
 		}
 	}
-
-	// Future terminal presentation point for wrist UI animation, holographic overlays, and contextual command routing.
 }
 
+// ============================================================
+// Interact / VoiceOverride
+// ============================================================
 void AA_PlayerCharacter::Interact()
 {
 	AcquireFocusedNode();
@@ -156,7 +375,6 @@ void AA_PlayerCharacter::Interact()
 			ActiveTerminalWidget->SetTargetNode(FocusedNode);
 			UpdateTerminalContextReadout();
 		}
-
 		ReportAcousticEvent(35.0f);
 	}
 }
@@ -177,7 +395,6 @@ void AA_PlayerCharacter::VoiceOverride()
 		{
 			UpdateTerminalContextReadout();
 			ReportAcousticEvent(60.0f);
-
 			if (CachedOmniKernel != nullptr)
 			{
 				CachedOmniKernel->ReportHackingDisturbance(GetActorLocation(), 2);
@@ -190,12 +407,14 @@ void AA_PlayerCharacter::VoiceOverride()
 	}
 }
 
+// ============================================================
+// Audio State Refresh
+// ============================================================
 void AA_PlayerCharacter::RefreshAudioState() const
 {
 	if (BiologicalSystems != nullptr && CachedAudioDirector != nullptr)
 	{
 		CachedAudioDirector->ApplyPsychoacousticFilters(BiologicalSystems->GetCurrentToxicity());
-
 		if (CachedOmniKernel != nullptr)
 		{
 			CachedAudioDirector->ApplyFinalPurgeMix(CachedOmniKernel->IsFinalPurgeActive());
@@ -203,6 +422,9 @@ void AA_PlayerCharacter::RefreshAudioState() const
 	}
 }
 
+// ============================================================
+// Sector State Update
+// ============================================================
 void AA_PlayerCharacter::UpdateSectorState(float DeltaTime)
 {
 	const bool bWasInSafeRoom = bInSafeRoom;
@@ -223,7 +445,6 @@ void AA_PlayerCharacter::UpdateSectorState(float DeltaTime)
 		{
 			const float ExposureRate = bInSafeRoom ? 0.0f : ActiveSectorVolume->GetEnvironmentalExposureRate();
 			BiologicalSystems->SetEnvironmentalExposureRate(ExposureRate);
-
 			if (bInSafeRoom)
 			{
 				BiologicalSystems->AdministerAntidote(2.5f * DeltaTime);
@@ -233,7 +454,6 @@ void AA_PlayerCharacter::UpdateSectorState(float DeltaTime)
 		if (bInSafeRoom)
 		{
 			AcousticOutputLevel = FMath::Min(AcousticOutputLevel, 10.0f);
-
 			if (!bWasInSafeRoom || PreviousSectorID != CurrentSectorID)
 			{
 				RegisterSafeRoomCheckpoint();
@@ -246,6 +466,9 @@ void AA_PlayerCharacter::UpdateSectorState(float DeltaTime)
 	}
 }
 
+// ============================================================
+// Safe Room Checkpoint
+// ============================================================
 void AA_PlayerCharacter::RegisterSafeRoomCheckpoint()
 {
 	if (!bInSafeRoom || BiologicalSystems == nullptr || CurrentSectorID.IsNone())
@@ -267,6 +490,9 @@ void AA_PlayerCharacter::RegisterSafeRoomCheckpoint()
 	}
 }
 
+// ============================================================
+// Biological Collapse / Checkpoint Recovery
+// ============================================================
 void AA_PlayerCharacter::HandleBiologicalCollapse()
 {
 	bBiologicalCollapseTriggered = true;
@@ -290,7 +516,6 @@ void AA_PlayerCharacter::RestoreFromCheckpoint()
 		{
 			SetActorTransform(ApexGameMode->GetLastCheckpointTransform());
 			LastCheckpointSectorID = ApexGameMode->GetLastSafeRoomSector();
-
 			if (BiologicalSystems != nullptr)
 			{
 				BiologicalSystems->SetEnvironmentalExposureRate(0.0f);
@@ -301,6 +526,7 @@ void AA_PlayerCharacter::RestoreFromCheckpoint()
 
 	AcousticOutputLevel = 0.0f;
 	bBiologicalCollapseTriggered = false;
+	InputLatencyBuffer.Empty(); // Flush deferred inputs on recovery
 
 	GetCharacterMovement()->StopMovementImmediately();
 
@@ -311,6 +537,9 @@ void AA_PlayerCharacter::RestoreFromCheckpoint()
 	}
 }
 
+// ============================================================
+// Terminal Context Readout
+// ============================================================
 void AA_PlayerCharacter::UpdateTerminalContextReadout() const
 {
 	if (ActiveTerminalWidget == nullptr)
@@ -332,11 +561,7 @@ void AA_PlayerCharacter::UpdateTerminalContextReadout() const
 	ActiveTerminalWidget->SetTelemetryReadout(
 		FString::Printf(
 			TEXT("SECTOR:%s | TOX:%.1f | EXP:%.2f | %s | %s"),
-			*SectorLabel,
-			ToxicityValue,
-			ExposureRate,
-			*SafeRoomState,
-			*PurgeState));
+			*SectorLabel, ToxicityValue, ExposureRate, *SafeRoomState, *PurgeState));
 
 	if (FocusedNode == nullptr)
 	{
@@ -351,6 +576,9 @@ void AA_PlayerCharacter::UpdateTerminalContextReadout() const
 	}
 }
 
+// ============================================================
+// Acoustic Event Reporting
+// ============================================================
 void AA_PlayerCharacter::ReportAcousticEvent(float Loudness)
 {
 	AcousticOutputLevel = FMath::Clamp(FMath::Max(AcousticOutputLevel, Loudness), 0.0f, 100.0f);
@@ -361,42 +589,9 @@ void AA_PlayerCharacter::ReportAcousticEvent(float Loudness)
 	}
 }
 
-void AA_PlayerCharacter::MoveForward(float Value)
-{
-	if (Controller != nullptr && !FMath::IsNearlyZero(Value))
-	{
-		const FRotator ControlRotation = Controller->GetControlRotation();
-		const FRotator YawRotation(0.0f, ControlRotation.Yaw, 0.0f);
-		const FVector ForwardDirection = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::X);
-
-		AddMovementInput(ForwardDirection, Value);
-		ReportAcousticEvent(40.0f);
-	}
-}
-
-void AA_PlayerCharacter::MoveRight(float Value)
-{
-	if (Controller != nullptr && !FMath::IsNearlyZero(Value))
-	{
-		const FRotator ControlRotation = Controller->GetControlRotation();
-		const FRotator YawRotation(0.0f, ControlRotation.Yaw, 0.0f);
-		const FVector RightDirection = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::Y);
-
-		AddMovementInput(RightDirection, Value);
-		ReportAcousticEvent(35.0f);
-	}
-}
-
-void AA_PlayerCharacter::TurnAtRate(float Value)
-{
-	AddControllerYawInput(Value);
-}
-
-void AA_PlayerCharacter::LookUpAtRate(float Value)
-{
-	AddControllerPitchInput(Value);
-}
-
+// ============================================================
+// Interaction Tracing
+// ============================================================
 AA_InteractiveNode* AA_PlayerCharacter::TraceInteractiveNode() const
 {
 	if (FollowCamera == nullptr)
@@ -436,7 +631,6 @@ AA_SectorVolume* AA_PlayerCharacter::ResolveCurrentSectorVolume() const
 		if (AA_SectorVolume* SectorVolume = Cast<AA_SectorVolume>(OverlappingActor))
 		{
 			const float DistanceSquared = FVector::DistSquared(SectorVolume->GetActorLocation(), GetActorLocation());
-
 			if (DistanceSquared < BestDistanceSquared)
 			{
 				BestDistanceSquared = DistanceSquared;
